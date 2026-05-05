@@ -20,6 +20,11 @@ import { PlayerActionHandler } from "./PlayerActionHandler";
 import { PlayerPanel } from "./PlayerPanel";
 import { TooltipItem } from "./RadialMenu";
 
+import {
+  BuildUnitIntentEvent,
+  SendUpgradeStructureIntentEvent,
+} from "../../Transport";
+
 import { EventBus } from "../../../core/EventBus";
 const allianceIcon = assetUrl("images/AllianceIconWhite.svg");
 const boatIcon = assetUrl("images/BoatIconWhite.svg");
@@ -63,12 +68,12 @@ export interface MenuElement {
 
   cooldown?: (params: MenuElementParams) => number;
   disabled: (params: MenuElementParams) => boolean;
-  action?: (params: MenuElementParams) => void; // For leaf items that perform actions
-  subMenu?: (params: MenuElementParams) => MenuElement[]; // For non-leaf items that open submenus
+  action?: (params: MenuElementParams) => void;
+  subMenu?: (params: MenuElementParams) => MenuElement[];
 
   renderType?: string;
 
-  timerFraction?: (params: MenuElementParams) => number; // 0..1, for arc timer overlay
+  timerFraction?: (params: MenuElementParams) => number;
 }
 
 export interface TooltipKey {
@@ -401,6 +406,81 @@ function getAllEnabledUnits(
   return units;
 }
 
+// Function to create the 1x/10x/100x upgrade submenu for a given build item
+function createUpgradeSubMenu(
+  item: BuildItemDisplay,
+  filterType: "attack" | "build",
+  elementIdPrefix: string,
+): MenuElement[] {
+  const options = [
+    { kind: "fixed", n: 1, label: "1x" },
+    { kind: "fixed", n: 10, label: "10x" },
+    { kind: "fixed", n: 100, label: "100x" },
+    { kind: "max", label: "MAX" },
+  ] as const;
+
+  const getAffordableUpgradeCount = (p: MenuElementParams): number => {
+    const bu = p.playerActions.buildableUnits.find(
+      (b) => b.type === item.unitType,
+    );
+    if (!bu || bu.canUpgrade === false || bu.cost <= 0n) {
+      return 0;
+    }
+    return Number(p.myPlayer.gold() / bu.cost);
+  };
+
+  return options.map((option) => ({
+    id:
+      option.kind === "max"
+        ? `${elementIdPrefix}_${item.unitType}_max`
+        : `${elementIdPrefix}_${item.unitType}_x${option.n}`,
+    name: option.label,
+    text: option.label,
+    fontSize: "16px",
+    color: filterType === "attack" ? COLORS.attack : COLORS.building,
+    disabled: (p: MenuElementParams): boolean => {
+      const affordable = getAffordableUpgradeCount(p);
+      return option.kind === "max" ? affordable < 1 : affordable < option.n;
+    },
+    tooltipItems: [
+      {
+        text:
+          option.kind === "max"
+            ? "Upgrade max"
+            : `Upgrade ${option.n}x`,
+        className: "title",
+      },
+      {
+        text:
+          option.kind === "max"
+            ? "Upgrade as much as possible"
+            : `Cost: ${option.n}x base cost`,
+        className: "description",
+      },
+    ],
+    action: (p: MenuElementParams): void => {
+      const bu = p.playerActions.buildableUnits.find(
+        (b) => b.type === item.unitType,
+      );
+      if (!bu || bu.canUpgrade === false) return;
+
+      const times =
+        option.kind === "max" ? getAffordableUpgradeCount(p) : option.n;
+
+      for (let i = 0; i < times; i++) {
+        p.eventBus.emit(
+          new SendUpgradeStructureIntentEvent(
+            bu.canUpgrade as number,
+            bu.type,
+          ),
+        );
+      }
+
+      p.closeMenu();
+    },
+  }));
+}
+
 function createMenuElements(
   params: MenuElementParams,
   filterType: "attack" | "build",
@@ -420,7 +500,30 @@ function createMenuElements(
           : !BuildableAttacks.has(item.unitType)),
     )
     .map((item: BuildItemDisplay) => {
-      return {
+      const buildableUnit = params.playerActions.buildableUnits.find(
+        (bu) => bu.type === item.unitType,
+      );
+
+      // True when there is an existing unit to upgrade at this tile
+      const isUpgrade =
+        buildableUnit !== undefined && buildableUnit.canUpgrade !== false;
+
+      const baseTooltipItems: TooltipItem[] = [
+        { text: translateText(item.key ?? ""), className: "title" },
+        {
+          text: translateText(item.description ?? ""),
+          className: "description",
+        },
+        {
+          text: `${renderNumber(params.buildMenu.cost(item))} ${translateText("player_panel.gold")}`,
+          className: "cost",
+        },
+        item.countable
+          ? { text: `${params.buildMenu.count(item)}x`, className: "count" }
+          : null,
+      ].filter((t): t is TooltipItem => t !== null);
+
+      const baseElement = {
         id: `${elementIdPrefix}_${item.unitType}`,
         name: item.key
           ? item.key.replace("unit_type.", "")
@@ -434,35 +537,32 @@ function createMenuElements(
               : COLORS.building
             : COLORS.building,
         icon: item.icon,
-        tooltipItems: [
-          { text: translateText(item.key ?? ""), className: "title" },
-          {
-            text: translateText(item.description ?? ""),
-            className: "description",
-          },
-          {
-            text: `${renderNumber(params.buildMenu.cost(item))} ${translateText("player_panel.gold")}`,
-            className: "cost",
-          },
-          item.countable
-            ? { text: `${params.buildMenu.count(item)}x`, className: "count" }
-            : null,
-        ].filter(
-          (tooltipItem): tooltipItem is TooltipItem => tooltipItem !== null,
-        ),
-        action: (params: MenuElementParams) => {
-          const buildableUnit = params.playerActions.buildableUnits.find(
-            (bu) => bu.type === item.unitType,
-          );
-          if (buildableUnit === undefined) {
-            return;
-          }
-          if (params.buildMenu.canBuildOrUpgrade(item)) {
-            params.buildMenu.sendBuildOrUpgrade(buildableUnit, params.tile);
-          }
-          params.closeMenu();
-        },
+        tooltipItems: baseTooltipItems,
       };
+
+      if (isUpgrade) {
+        // Upgradeable: open a 1x/10x/100x submenu instead of acting directly
+        return {
+          ...baseElement,
+          subMenu: (_p: MenuElementParams): MenuElement[] =>
+            createUpgradeSubMenu(item, filterType, elementIdPrefix),
+        };
+      } else {
+        // New build or non-upgradeable: act directly as before
+        return {
+          ...baseElement,
+          action: (p: MenuElementParams): void => {
+            const bu = p.playerActions.buildableUnits.find(
+              (b) => b.type === item.unitType,
+            );
+            if (bu === undefined) return;
+            if (p.buildMenu.canBuildOrUpgrade(item)) {
+              p.buildMenu.sendBuildOrUpgrade(bu, p.tile);
+            }
+            p.closeMenu();
+          },
+        };
+      }
     });
 }
 
